@@ -1,0 +1,206 @@
+name: Deploy CloudMentor Production
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Lambda backend and EC2 frontend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Set up AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+
+      - name: Validate required secrets
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          SAM_STACK_NAME: ${{ secrets.SAM_STACK_NAME }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          AI_MODE: ${{ secrets.AI_MODE }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          : "${AWS_REGION:?Missing AWS_REGION secret}"
+          : "${SAM_STACK_NAME:?Missing SAM_STACK_NAME secret}"
+          : "${EC2_HOST:?Missing EC2_HOST secret}"
+          : "${EC2_USER:?Missing EC2_USER secret}"
+          : "${EC2_SSH_KEY:?Missing EC2_SSH_KEY secret}"
+
+          MODE="${AI_MODE:-openai}"
+          if [ "$MODE" != "mock" ] && [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "OPENAI_API_KEY is required when AI_MODE is openai. Use AI_MODE=mock for a no-billing demo deployment."
+            exit 1
+          fi
+
+      - name: Build and deploy backend with AWS SAM
+        working-directory: backend
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          SAM_STACK_NAME: ${{ secrets.SAM_STACK_NAME }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          AI_MODE: ${{ secrets.AI_MODE }}
+          CORS_ORIGIN: ${{ secrets.CORS_ORIGIN }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          set -euo pipefail
+          npm install --no-audit --no-fund
+          sam build
+
+          MODEL_VALUE="${OPENAI_MODEL:-gpt-4.1-mini}"
+          MODE_VALUE="${AI_MODE:-openai}"
+          KEY_VALUE="${OPENAI_API_KEY:-mock-placeholder-no-openai-key}"
+          CORS_VALUE="${CORS_ORIGIN:-http://${EC2_HOST}}"
+
+          sam deploy \
+            --stack-name "$SAM_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --capabilities CAPABILITY_IAM \
+            --resolve-s3 \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              OpenAiApiKey="$KEY_VALUE" \
+              OpenAiModel="$MODEL_VALUE" \
+              AiMode="$MODE_VALUE" \
+              CorsOrigin="$CORS_VALUE"
+
+      - name: Read backend outputs
+        id: backend_outputs
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          SAM_STACK_NAME: ${{ secrets.SAM_STACK_NAME }}
+        run: |
+          set -euo pipefail
+          API_BASE_URL=$(aws cloudformation describe-stacks \
+            --stack-name "$SAM_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiBaseUrl'].OutputValue" \
+            --output text)
+
+          TABLE_NAME=$(aws cloudformation describe-stacks \
+            --stack-name "$SAM_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs[?OutputKey=='TableName'].OutputValue" \
+            --output text)
+
+          MATERIALS_BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name "$SAM_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs[?OutputKey=='MaterialsBucketName'].OutputValue" \
+            --output text)
+
+          echo "api_base_url=$API_BASE_URL" >> "$GITHUB_OUTPUT"
+          echo "table_name=$TABLE_NAME" >> "$GITHUB_OUTPUT"
+          echo "materials_bucket=$MATERIALS_BUCKET" >> "$GITHUB_OUTPUT"
+          echo "Backend API: $API_BASE_URL"
+          echo "DynamoDB table: $TABLE_NAME"
+          echo "S3 bucket: $MATERIALS_BUCKET"
+
+      - name: Build frontend for EC2
+        working-directory: frontend
+        env:
+          VITE_API_BASE_URL: ${{ steps.backend_outputs.outputs.api_base_url }}
+        run: |
+          set -euo pipefail
+          npm install --no-audit --no-fund
+          npm run build
+
+      - name: Prepare SSH key
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          echo "$EC2_SSH_KEY" > ~/.ssh/cloudmentor.pem
+          chmod 600 ~/.ssh/cloudmentor.pem
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+      - name: Bootstrap EC2 web server
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_APP_DIR: ${{ secrets.EC2_APP_DIR }}
+        run: |
+          set -euo pipefail
+          APP_DIR="${EC2_APP_DIR:-/opt/cloudmentor}"
+          ssh -i ~/.ssh/cloudmentor.pem "$EC2_USER@$EC2_HOST" \
+            "APP_DIR='$APP_DIR' bash -s" < scripts/prod-ec2-bootstrap.sh
+
+      - name: Push full source code to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_APP_DIR: ${{ secrets.EC2_APP_DIR }}
+        run: |
+          set -euo pipefail
+          APP_DIR="${EC2_APP_DIR:-/opt/cloudmentor}"
+
+          rsync -az --delete \
+            --exclude '.git' \
+            --exclude 'node_modules' \
+            --exclude 'frontend/node_modules' \
+            --exclude 'backend/node_modules' \
+            --exclude 'frontend/dist' \
+            --exclude 'backend/.aws-sam' \
+            --exclude 'backend/env.json' \
+            --exclude 'backend/env.local.json' \
+            --exclude 'backend/env.ec2.json' \
+            --exclude 'backend/env.production.json' \
+            --exclude 'frontend/.env' \
+            --exclude 'frontend/.env.local' \
+            --exclude 'frontend/.env.ec2' \
+            --exclude 'frontend/.env.production' \
+            --exclude '*.zip' \
+            -e "ssh -i ~/.ssh/cloudmentor.pem" \
+            ./ "$EC2_USER@$EC2_HOST:$APP_DIR/"
+
+      - name: Publish frontend build to Nginx
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          set -euo pipefail
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/cloudmentor.pem" \
+            frontend/dist/ "$EC2_USER@$EC2_HOST:/tmp/cloudmentor-dist/"
+
+          ssh -i ~/.ssh/cloudmentor.pem "$EC2_USER@$EC2_HOST" \
+            "sudo mkdir -p /var/www/cloudmentor && \
+             sudo rsync -a --delete /tmp/cloudmentor-dist/ /var/www/cloudmentor/ && \
+             sudo chown -R www-data:www-data /var/www/cloudmentor && \
+             sudo nginx -t && \
+             sudo systemctl reload nginx"
+
+      - name: Deployment summary
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          echo "CloudMentor frontend: http://${EC2_HOST}"
+          echo "CloudMentor backend:  ${{ steps.backend_outputs.outputs.api_base_url }}"
+          echo "S3 bucket:            ${{ steps.backend_outputs.outputs.materials_bucket }}"
+          echo "DynamoDB table:       ${{ steps.backend_outputs.outputs.table_name }}"

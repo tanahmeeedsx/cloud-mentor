@@ -1,0 +1,199 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: CloudMentor - OpenAI + Lambda + API Gateway + DynamoDB + S3 uploads
+
+Parameters:
+  OpenAiApiKey:
+    Type: String
+    NoEcho: true
+    Default: mock-placeholder-no-openai-key
+    Description: OpenAI API key. Use a real key for AiMode=openai. For AiMode=mock, the placeholder is ignored.
+  OpenAiModel:
+    Type: String
+    Default: gpt-4.1-mini
+    Description: OpenAI text model to use.
+  AiMode:
+    Type: String
+    Default: openai
+    AllowedValues:
+      - openai
+      - mock
+    Description: Use openai for real AI calls or mock for classroom demos without API billing.
+  CorsOrigin:
+    Type: String
+    Default: '*'
+    Description: Allowed frontend origin. Use * for classroom demo only.
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures:
+      - arm64
+    Timeout: 30
+    MemorySize: 512
+    Tracing: Active
+    Environment:
+      Variables:
+        OPENAI_API_KEY: !Ref OpenAiApiKey
+        OPENAI_MODEL: !Ref OpenAiModel
+        AI_MODE: !Ref AiMode
+        TABLE_NAME: !Ref CloudMentorTable
+        MATERIALS_BUCKET: !Ref CloudMentorMaterialsBucket
+        CORS_ORIGIN: !Ref CorsOrigin
+        STORAGE_MODE: s3
+
+Resources:
+  CloudMentorHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref CorsOrigin
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+          - x-amz-date
+          - x-amz-security-token
+          - x-amz-content-sha256
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - OPTIONS
+        MaxAge: 600
+
+  CloudMentorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: src/app.handler
+      FunctionName: !Sub '${AWS::StackName}-api'
+      Description: CloudMentor Lambda API
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CloudMentorTable
+        - S3CrudPolicy:
+            BucketName: !Ref CloudMentorMaterialsBucket
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudMentorHttpApi
+            Path: /health
+            Method: GET
+        UploadUrl:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudMentorHttpApi
+            Path: /upload-url
+            Method: POST
+        ProcessFile:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudMentorHttpApi
+            Path: /process-file
+            Method: POST
+        LocalUpload:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudMentorHttpApi
+            Path: /local-upload/{proxy+}
+            Method: PUT
+        Summarize:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudMentorHttpApi
+            Path: /summarize
+            Method: POST
+        Quiz:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudMentorHttpApi
+            Path: /quiz
+            Method: POST
+        Flashcards:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudMentorHttpApi
+            Path: /flashcards
+            Method: POST
+        StudyPlan:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudMentorHttpApi
+            Path: /study-plan
+            Method: POST
+        History:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudMentorHttpApi
+            Path: /history
+            Method: GET
+        Progress:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CloudMentorHttpApi
+            Path: /save-progress
+            Method: POST
+
+
+  CloudMentorFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-api'
+      RetentionInDays: 14
+
+  CloudMentorTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: createdAtId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: createdAtId
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+
+  CloudMentorMaterialsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - PUT
+              - GET
+              - HEAD
+            AllowedOrigins:
+              - !Ref CorsOrigin
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3000
+
+Outputs:
+  ApiBaseUrl:
+    Description: Base URL for the API Gateway HTTP API
+    Value: !Sub 'https://${CloudMentorHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  TableName:
+    Description: DynamoDB table name
+    Value: !Ref CloudMentorTable
+  MaterialsBucketName:
+    Description: Private S3 bucket for uploaded CloudMentor study materials
+    Value: !Ref CloudMentorMaterialsBucket
